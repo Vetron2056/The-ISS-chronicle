@@ -1,0 +1,8 @@
+{
+  "name": "ISS Orbital Chronicle (1998–2031)",
+  "description": "Interactive 3D documentary visualization of the International Space Station from the launch of Zarya in 1998 to its planned 2031 atmospheric deorbit.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
