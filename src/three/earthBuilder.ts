@@ -1,9 +1,24 @@
 import * as THREE from 'three';
+import { DistanceTextureManager, TextureLodTier } from './textureManager';
 
 export const EARTH_RADIUS = 110;
 
-const BLUE_MARBLE_URL = '/src/assets/images/earth_bluemarble_map_1795252551304.jpg';
-const CLOUDS_MAP_URL = '/src/assets/images/earth_clouds_map_1795252551603.jpg';
+// Verified CORS-enabled NASA Visible Earth / Blue Marble archives + bundled local fallbacks
+const LOCAL_BLUE_MARBLE_URL = '/src/assets/images/earth_bluemarble_map_1795252551304.jpg';
+const LOCAL_CLOUDS_URL = '/src/assets/images/earth_clouds_map_1795252551603.jpg';
+
+const NASA_EARTH_DAY_4K =
+  'https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/planets/earth_day_4096.jpg';
+const NASA_EARTH_ATMOS_2K =
+  'https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/planets/earth_atmos_2048.jpg';
+const NASA_EARTH_NORMAL_2K =
+  'https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/planets/earth_normal_2048.jpg';
+const NASA_EARTH_SPECULAR_2K =
+  'https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/planets/earth_specular_2048.jpg';
+const NASA_EARTH_LIGHTS_2K =
+  'https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/planets/earth_lights_2048.png';
+const NASA_EARTH_CLOUDS_1K =
+  'https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/planets/earth_clouds_1024.png';
 
 export function latLonToVector3(latDeg: number, lonDeg: number, radius: number): THREE.Vector3 {
   const phi = (90 - latDeg) * (Math.PI / 180);
@@ -15,72 +30,66 @@ export function latLonToVector3(latDeg: number, lonDeg: number, radius: number):
 }
 
 /**
- * Derives pixel-aligned ocean specular roughness map and topographic bump map
- * directly from the loaded Blue Marble satellite image.
+ * Converts NASA ocean specular mask (white = water, black = land) into a PBR roughness map
+ * (glossy ocean sun-glint ~0.24, matte continents ~0.90).
  */
-function deriveEarthSurfaceMaps(
+function buildRoughnessFromSpecular(
   img: HTMLImageElement,
+  w: number,
+  h: number,
   maxAnisotropy: number
-): { roughnessMap: THREE.CanvasTexture; bumpMap: THREE.CanvasTexture } {
-  const w = 1024;
-  const h = 512;
-
-  const srcCanvas = document.createElement('canvas');
-  srcCanvas.width = w;
-  srcCanvas.height = h;
-  const srcCtx = srcCanvas.getContext('2d')!;
-  srcCtx.drawImage(img, 0, 0, w, h);
-  const pixels = srcCtx.getImageData(0, 0, w, h).data;
-
-  const roughCanvas = document.createElement('canvas');
-  roughCanvas.width = w;
-  roughCanvas.height = h;
-  const roughCtx = roughCanvas.getContext('2d')!;
-  const roughImg = roughCtx.createImageData(w, h);
-
-  const bumpCanvas = document.createElement('canvas');
-  bumpCanvas.width = w;
-  bumpCanvas.height = h;
-  const bumpCtx = bumpCanvas.getContext('2d')!;
-  const bumpImg = bumpCtx.createImageData(w, h);
-
-  for (let i = 0; i < w * h; i++) {
-    const off = i * 4;
-    const r = pixels[off];
-    const g = pixels[off + 1];
-    const b = pixels[off + 2];
-
-    // Identify ocean vs land/ice from blue dominance & low red channel
-    const isOcean = b > r + 14 && b > g + 4 && r < 68;
-    const lum = (r * 0.299 + g * 0.587 + b * 0.114);
-
-    // Glossy oceans (~0.24 roughness) for orbital sun-glint; matte continents (~0.88)
-    const roughVal = isOcean ? 62 : 224;
-    roughImg.data[off] = roughVal;
-    roughImg.data[off + 1] = roughVal;
-    roughImg.data[off + 2] = roughVal;
-    roughImg.data[off + 3] = 255;
-
-    // Elevation relief: flat oceans (0), raised continents/mountains scaled by brightness
-    const elev = isOcean ? 8 : Math.min(255, Math.floor(60 + lum * 0.78));
-    bumpImg.data[off] = elev;
-    bumpImg.data[off + 1] = elev;
-    bumpImg.data[off + 2] = elev;
-    bumpImg.data[off + 3] = 255;
+): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(img, 0, 0, w, h);
+  const id = ctx.getImageData(0, 0, w, h);
+  const d = id.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const spec = d[i] / 255; // 1 = ocean, 0 = land
+    const rough = Math.round(230 - spec * 168); // 230 (~0.90) land -> 62 (~0.24) ocean
+    d[i] = rough;
+    d[i + 1] = rough;
+    d[i + 2] = rough;
+    d[i + 3] = 255;
   }
+  ctx.putImageData(id, 0, 0);
 
-  roughCtx.putImageData(roughImg, 0, 0);
-  bumpCtx.putImageData(bumpImg, 0, 0);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.anisotropy = maxAnisotropy;
+  tex.needsUpdate = true;
+  return tex;
+}
 
-  const roughnessMap = new THREE.CanvasTexture(roughCanvas);
-  roughnessMap.anisotropy = maxAnisotropy;
-  roughnessMap.wrapS = THREE.RepeatWrapping;
+/**
+ * Composites RGBA or grayscale satellite cloud map onto a black canvas so Three.js
+ * alphaMap reads crisp cloud opacity consistently for both PNG and JPG sources.
+ */
+function buildCloudAlphaTexture(
+  img: HTMLImageElement,
+  w: number,
+  h: number,
+  maxAnisotropy: number
+): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d')!;
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, w, h);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, 0, 0, w, h);
 
-  const bumpMap = new THREE.CanvasTexture(bumpCanvas);
-  bumpMap.anisotropy = maxAnisotropy;
-  bumpMap.wrapS = THREE.RepeatWrapping;
-
-  return { roughnessMap, bumpMap };
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.anisotropy = maxAnisotropy;
+  tex.needsUpdate = true;
+  return tex;
 }
 
 export interface EarthSystem {
@@ -94,42 +103,55 @@ export interface EarthSystem {
   dispose: () => void;
 }
 
-export function createEarthSystem(maxAnisotropy: number): EarthSystem {
+export function createEarthSystem(
+  textureManager: DistanceTextureManager,
+  sunDir: THREE.Vector3
+): EarthSystem {
   const group = new THREE.Group();
   const disposables: Array<{ dispose: () => void }> = [];
-  const loader = new THREE.TextureLoader();
 
-  // Earth Surface Material
+  // Earth Surface Material with night-side Black Marble city lights attenuation
   const earthGeo = new THREE.SphereGeometry(EARTH_RADIUS, 96, 64);
+  const sunDirUniform = { value: sunDir.clone().normalize() };
+
   const earthMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color('#ffffff'),
-    roughness: 0.92,
-    metalness: 0.05,
-    bumpScale: 0.55,
+    roughness: 0.9,
+    metalness: 0.04,
+    normalScale: new THREE.Vector2(0.85, 0.85),
+    emissive: new THREE.Color('#ffd38a'),
+    emissiveIntensity: 0.0,
   });
+
+  earthMat.onBeforeCompile = (shader) => {
+    shader.uniforms.uSunDir = sunDirUniform;
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+varying vec3 vEarthWorldNormal;`
+      )
+      .replace(
+        '#include <beginnormal_vertex>',
+        `#include <beginnormal_vertex>
+vEarthWorldNormal = normalize(mat3(modelMatrix) * objectNormal);`
+      );
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+uniform vec3 uSunDir;
+varying vec3 vEarthWorldNormal;`
+      )
+      .replace(
+        '#include <emissivemap_fragment>',
+        `#include <emissivemap_fragment>
+float earthNightMask = smoothstep(0.14, -0.22, dot(normalize(vEarthWorldNormal), normalize(uSunDir)));
+totalEmissiveRadiance *= earthNightMask;`
+      );
+  };
+  earthMat.customProgramCacheKey = () => 'earth-day-night-v1';
   disposables.push(earthGeo, earthMat);
-
-  // Load Blue Marble photorealistic satellite map & derive ocean specular + mountain bump maps
-  const blueMarbleTex = loader.load(BLUE_MARBLE_URL, (tex) => {
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.anisotropy = maxAnisotropy;
-    tex.wrapS = THREE.RepeatWrapping;
-    tex.needsUpdate = true;
-
-    const img = tex.image as HTMLImageElement | undefined;
-    if (img) {
-      const { roughnessMap, bumpMap } = deriveEarthSurfaceMaps(img, maxAnisotropy);
-      earthMat.roughnessMap = roughnessMap;
-      earthMat.bumpMap = bumpMap;
-      earthMat.needsUpdate = true;
-      disposables.push(roughnessMap, bumpMap);
-    }
-  });
-  blueMarbleTex.colorSpace = THREE.SRGBColorSpace;
-  blueMarbleTex.anisotropy = maxAnisotropy;
-  blueMarbleTex.wrapS = THREE.RepeatWrapping;
-  earthMat.map = blueMarbleTex;
-  disposables.push(blueMarbleTex);
 
   const earthMesh = new THREE.Mesh(earthGeo, earthMat);
   earthMesh.receiveShadow = true;
@@ -137,26 +159,162 @@ export function createEarthSystem(maxAnisotropy: number): EarthSystem {
 
   // Satellite Global Cloud Layer
   const cloudsGeo = new THREE.SphereGeometry(EARTH_RADIUS + 0.72, 72, 48);
-  const cloudsAlphaTex = loader.load(CLOUDS_MAP_URL, (tex) => {
-    tex.anisotropy = maxAnisotropy;
-    tex.wrapS = THREE.RepeatWrapping;
-    tex.needsUpdate = true;
-  });
-  cloudsAlphaTex.anisotropy = maxAnisotropy;
-  cloudsAlphaTex.wrapS = THREE.RepeatWrapping;
-
   const cloudsMat = new THREE.MeshStandardMaterial({
     color: 0xffffff,
-    alphaMap: cloudsAlphaTex,
     transparent: true,
-    opacity: 0.82,
+    opacity: 0.84,
     depthWrite: false,
-    roughness: 0.95,
+    roughness: 0.94,
     metalness: 0.0,
   });
-  disposables.push(cloudsGeo, cloudsMat, cloudsAlphaTex);
+  disposables.push(cloudsGeo, cloudsMat);
   const cloudsMesh = new THREE.Mesh(cloudsGeo, cloudsMat);
   group.add(cloudsMesh);
+
+  // Register Earth Surface Multi-Tier LOD Slot
+  textureManager.registerSlot(
+    {
+      id: 'earth-surface',
+      thresholds: { high: 48, medium: 84, hysteresis: 6 },
+      getDistance: (cameraPos, tempVec) => {
+        earthMesh.getWorldPosition(tempVec);
+        return Math.max(0, cameraPos.distanceTo(tempVec) - EARTH_RADIUS);
+      },
+      loadTier: async (tier: TextureLodTier, ctx) => {
+        if (tier === 'low') {
+          const dayImg = await ctx.loadImage(LOCAL_BLUE_MARBLE_URL);
+          const dayTex = ctx.createTextureFromImage(dayImg, {
+            targetWidth: 512,
+            targetHeight: 256,
+            colorSpace: THREE.SRGBColorSpace,
+            wrapS: THREE.RepeatWrapping,
+          });
+          return {
+            textures: [dayTex],
+            apply: () => {
+              earthMat.map = dayTex;
+              earthMat.roughnessMap = null;
+              earthMat.normalMap = null;
+              earthMat.emissiveMap = null;
+              earthMat.emissiveIntensity = 0.0;
+              earthMat.needsUpdate = true;
+            },
+          };
+        }
+
+        if (tier === 'medium') {
+          const [dayImg, specImg] = await Promise.all([
+            ctx.loadImage(NASA_EARTH_ATMOS_2K, LOCAL_BLUE_MARBLE_URL),
+            ctx.loadImage(NASA_EARTH_SPECULAR_2K).catch(() => null),
+          ]);
+          const dayTex = ctx.createTextureFromImage(dayImg, {
+            targetWidth: 1024,
+            targetHeight: 512,
+            colorSpace: THREE.SRGBColorSpace,
+            wrapS: THREE.RepeatWrapping,
+          });
+          const textures: THREE.Texture[] = [dayTex];
+          const roughTex = specImg
+            ? buildRoughnessFromSpecular(specImg, 512, 256, ctx.maxAnisotropy)
+            : null;
+          if (roughTex) textures.push(roughTex);
+
+          return {
+            textures,
+            apply: () => {
+              earthMat.map = dayTex;
+              earthMat.roughnessMap = roughTex;
+              earthMat.normalMap = null;
+              earthMat.emissiveMap = null;
+              earthMat.emissiveIntensity = 0.0;
+              earthMat.needsUpdate = true;
+            },
+          };
+        }
+
+        // High LOD: Full 4K NASA Blue Marble + 2K Normal + 2K Specular Roughness + 2K Night Lights
+        const [dayImg, normImg, specImg, lightsImg] = await Promise.all([
+          ctx.loadImage(NASA_EARTH_DAY_4K, LOCAL_BLUE_MARBLE_URL),
+          ctx.loadImage(NASA_EARTH_NORMAL_2K).catch(() => null),
+          ctx.loadImage(NASA_EARTH_SPECULAR_2K).catch(() => null),
+          ctx.loadImage(NASA_EARTH_LIGHTS_2K).catch(() => null),
+        ]);
+
+        const dayTex = ctx.createTextureFromImage(dayImg, {
+          colorSpace: THREE.SRGBColorSpace,
+          wrapS: THREE.RepeatWrapping,
+        });
+        const textures: THREE.Texture[] = [dayTex];
+
+        const normTex = normImg
+          ? ctx.createTextureFromImage(normImg, {
+              colorSpace: THREE.NoColorSpace,
+              wrapS: THREE.RepeatWrapping,
+            })
+          : null;
+        if (normTex) textures.push(normTex);
+
+        const roughTex = specImg
+          ? buildRoughnessFromSpecular(specImg, 1024, 512, ctx.maxAnisotropy)
+          : null;
+        if (roughTex) textures.push(roughTex);
+
+        const lightsTex = lightsImg
+          ? ctx.createTextureFromImage(lightsImg, {
+              targetWidth: 1024,
+              targetHeight: 512,
+              colorSpace: THREE.SRGBColorSpace,
+              wrapS: THREE.RepeatWrapping,
+            })
+          : null;
+        if (lightsTex) textures.push(lightsTex);
+
+        return {
+          textures,
+          apply: () => {
+            earthMat.map = dayTex;
+            earthMat.normalMap = normTex;
+            earthMat.roughnessMap = roughTex;
+            earthMat.emissiveMap = lightsTex;
+            earthMat.emissiveIntensity = lightsTex ? 0.9 : 0.0;
+            earthMat.needsUpdate = true;
+          },
+        };
+      },
+    },
+    'high'
+  );
+
+  // Register Earth Clouds Multi-Tier LOD Slot
+  textureManager.registerSlot(
+    {
+      id: 'earth-clouds',
+      thresholds: { high: 52, medium: 86, hysteresis: 6 },
+      getDistance: (cameraPos, tempVec) => {
+        cloudsMesh.getWorldPosition(tempVec);
+        return Math.max(0, cameraPos.distanceTo(tempVec) - EARTH_RADIUS);
+      },
+      loadTier: async (tier: TextureLodTier, ctx) => {
+        const useHighUrl = tier === 'high' || tier === 'medium';
+        const img = await ctx.loadImage(
+          useHighUrl ? NASA_EARTH_CLOUDS_1K : LOCAL_CLOUDS_URL,
+          LOCAL_CLOUDS_URL
+        );
+        const w = tier === 'high' ? 1024 : tier === 'medium' ? 512 : 256;
+        const h = tier === 'high' ? 512 : tier === 'medium' ? 256 : 128;
+        const alphaTex = buildCloudAlphaTexture(img, w, h, ctx.maxAnisotropy);
+
+        return {
+          textures: [alphaTex],
+          apply: () => {
+            cloudsMat.alphaMap = alphaTex;
+            cloudsMat.needsUpdate = true;
+          },
+        };
+      },
+    },
+    'high'
+  );
 
   // Atmospheric Rayleigh Scattering Fresnel Halo
   const atmosGeo = new THREE.SphereGeometry(EARTH_RADIUS + 3.4, 72, 48);

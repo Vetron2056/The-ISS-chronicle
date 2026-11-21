@@ -6,6 +6,7 @@ import { CameraPresetId, ISS_MODULES } from '../data/issTimeline';
 import { createEarthSystem } from '../three/earthBuilder';
 import { createISSSystem } from '../three/issBuilder';
 import { createReentrySystem } from '../three/reentryEffects';
+import { DistanceTextureManager } from '../three/textureManager';
 
 interface IssViewportProps {
   year: number;
@@ -177,13 +178,15 @@ export function IssViewport({
     rimLight.position.set(-45, 25, -55);
     scene.add(rimLight);
 
-    // 5. Build 3D Subsystems
+    // 5. Build 3D Subsystems & Distance-Based Texture LOD Manager
     const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
-    const earthSystem = createEarthSystem(maxAnisotropy);
+    const textureManager = new DistanceTextureManager(maxAnisotropy);
+
+    const earthSystem = createEarthSystem(textureManager, sunDir);
     scene.add(earthSystem.starfield);
     scene.add(earthSystem.group);
 
-    const issSystem = createISSSystem(maxAnisotropy, isSoftwareGl);
+    const issSystem = createISSSystem(textureManager, maxAnisotropy, isSoftwareGl);
     issSystemRef.current = issSystem;
     scene.add(issSystem.root);
 
@@ -195,9 +198,10 @@ export function IssViewport({
     controls.enableDamping = !isSoftwareGl;
     controls.dampingFactor = 0.06;
     controls.minDistance = 4.5;
-    controls.maxDistance = 85;
+    controls.maxDistance = 120;
     controls.enablePan = true;
     controls.target.set(...PRESET_VIEWS.orbital.target);
+    textureManager.update(camera.position, 0, true);
 
     const cancelTransition = () => {
       camTransitionRef.current.active = false;
@@ -348,6 +352,7 @@ export function IssViewport({
       }
 
       controls.update();
+      textureManager.update(camera.position, elapsed);
       renderer.render(scene, camera);
 
       if (isSoftwareGl) {
@@ -374,6 +379,7 @@ export function IssViewport({
       earthSystem.dispose();
       issSystem.dispose();
       reentrySystem.dispose();
+      textureManager.dispose();
       envTex.dispose();
       renderer.dispose();
       if (canvas.parentNode === container) {

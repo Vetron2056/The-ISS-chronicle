@@ -1,4 +1,10 @@
 import * as THREE from 'three';
+import { DistanceTextureManager, TextureLodTier } from './textureManager';
+
+const ISS_HULL_TEX_URL = '/src/assets/images/iss_hull_phototex_1795252551840.jpg';
+const ISS_RUSSIAN_TEX_URL = '/src/assets/images/iss_russian_mlm_tex_1795256358729.jpg';
+const ISS_RADIATOR_TEX_URL = '/src/assets/images/iss_radiator_truss_tex_1795256358751.jpg';
+const ISS_SOLAR_TEX_URL = '/src/assets/images/iss_solar_phototex_1795252551889.jpg';
 
 export interface ISSModuleNode {
   id: string;
@@ -157,7 +163,11 @@ function createAgingCrackTexture(maxAnisotropy: number): THREE.CanvasTexture {
   return tex;
 }
 
-export function createISSSystem(maxAnisotropy: number, isSoftwareGl: boolean): ISSSystem {
+export function createISSSystem(
+  textureManager: DistanceTextureManager,
+  maxAnisotropy: number,
+  isSoftwareGl: boolean
+): ISSSystem {
   const root = new THREE.Group();
   const stationGroup = new THREE.Group();
   root.add(stationGroup);
@@ -166,11 +176,12 @@ export function createISSSystem(maxAnisotropy: number, isSoftwareGl: boolean): I
   const moduleNodes = new Map<string, ISSModuleNode>();
   const clickableObjects: THREE.Object3D[] = [];
 
-  // Load photorealistic ISS hardware textures (with seamless tiling & bump derivation)
-  const texLoader = new THREE.TextureLoader();
-
-  const deriveBumpFromImage = (img: HTMLImageElement, repeatX: number, repeatY: number): THREE.CanvasTexture => {
-    const size = 256;
+  const deriveBumpFromImage = (
+    img: HTMLImageElement,
+    size: number,
+    repeatX: number,
+    repeatY: number
+  ): THREE.CanvasTexture => {
     const c = document.createElement('canvas');
     c.width = size;
     c.height = size;
@@ -186,11 +197,12 @@ export function createISSSystem(maxAnisotropy: number, isSoftwareGl: boolean): I
     }
     ctx.putImageData(id, 0, 0);
     const bump = new THREE.CanvasTexture(c);
+    bump.colorSpace = THREE.NoColorSpace;
     bump.anisotropy = maxAnisotropy;
     bump.wrapS = THREE.RepeatWrapping;
     bump.wrapT = THREE.RepeatWrapping;
     bump.repeat.set(repeatX, repeatY);
-    disposables.push(bump);
+    bump.needsUpdate = true;
     return bump;
   };
 
@@ -200,55 +212,6 @@ export function createISSSystem(maxAnisotropy: number, isSoftwareGl: boolean): I
   const whiteMliFallback = createMLIBlanketTexture(maxAnisotropy, '#e4e8ee', '#b7c0cc');
   const crackTex = createAgingCrackTexture(maxAnisotropy);
   disposables.push(solarGoldFallback, solarBlueTex, whiteMliFallback, crackTex);
-
-  const hullPhotoTex = texLoader.load(
-    '/src/assets/images/iss_hull_phototex_1795252551840.jpg',
-    (tex) => {
-      tex.colorSpace = THREE.SRGBColorSpace;
-      tex.anisotropy = maxAnisotropy;
-      tex.wrapS = THREE.RepeatWrapping;
-      tex.wrapT = THREE.RepeatWrapping;
-      tex.repeat.set(2, 2);
-      tex.needsUpdate = true;
-
-      const img = tex.image as HTMLImageElement | undefined;
-      if (img) {
-        const hullBump = deriveBumpFromImage(img, 2, 2);
-        brushedAlumMat.map = tex;
-        brushedAlumMat.bumpMap = hullBump;
-        brushedAlumMat.bumpScale = 0.04;
-        brushedAlumMat.needsUpdate = true;
-
-        russianCreamMat.map = tex;
-        russianCreamMat.bumpMap = hullBump;
-        russianCreamMat.bumpScale = 0.045;
-        russianCreamMat.needsUpdate = true;
-      }
-    }
-  );
-  disposables.push(hullPhotoTex);
-
-  const solarPhotoTex = texLoader.load(
-    '/src/assets/images/iss_solar_phototex_1795252551889.jpg',
-    (tex) => {
-      tex.colorSpace = THREE.SRGBColorSpace;
-      tex.anisotropy = maxAnisotropy;
-      tex.wrapS = THREE.RepeatWrapping;
-      tex.wrapT = THREE.RepeatWrapping;
-      tex.repeat.set(1, 5);
-      tex.needsUpdate = true;
-
-      const img = tex.image as HTMLImageElement | undefined;
-      if (img) {
-        const solarBump = deriveBumpFromImage(img, 1, 5);
-        solarGoldMat.map = tex;
-        solarGoldMat.bumpMap = solarBump;
-        solarGoldMat.bumpScale = 0.025;
-        solarGoldMat.needsUpdate = true;
-      }
-    }
-  );
-  disposables.push(solarPhotoTex);
 
   // Calibrated PBR Material Palette (distinct roughness & metalness variation)
   const makeMat = (opts: THREE.MeshStandardMaterialParameters): THREE.MeshStandardMaterial => {
@@ -306,6 +269,135 @@ export function createISSSystem(maxAnisotropy: number, isSoftwareGl: boolean): I
     metalness: 0.65,
     side: THREE.DoubleSide,
   });
+
+  // Register ISS Hull, Russian MLI & Radiator/Truss LOD Slot
+  textureManager.registerSlot(
+    {
+      id: 'iss-hull',
+      thresholds: { high: 24, medium: 50, hysteresis: 4 },
+      getDistance: (cameraPos, tempVec) => {
+        stationGroup.getWorldPosition(tempVec);
+        return cameraPos.distanceTo(tempVec);
+      },
+      loadTier: async (tier: TextureLodTier, ctx) => {
+        const res = tier === 'high' ? 1024 : tier === 'medium' ? 512 : 256;
+        const [hullImg, russianImg, radiatorImg] = await Promise.all([
+          ctx.loadImage(ISS_HULL_TEX_URL),
+          ctx.loadImage(ISS_RUSSIAN_TEX_URL, ISS_HULL_TEX_URL),
+          ctx.loadImage(ISS_RADIATOR_TEX_URL, ISS_HULL_TEX_URL),
+        ]);
+
+        const hullTex = ctx.createTextureFromImage(hullImg, {
+          targetWidth: res,
+          targetHeight: res,
+          colorSpace: THREE.SRGBColorSpace,
+          wrapS: THREE.RepeatWrapping,
+          wrapT: THREE.RepeatWrapping,
+          repeatX: 2,
+          repeatY: 2,
+        });
+        const russianTex = ctx.createTextureFromImage(russianImg, {
+          targetWidth: res,
+          targetHeight: res,
+          colorSpace: THREE.SRGBColorSpace,
+          wrapS: THREE.RepeatWrapping,
+          wrapT: THREE.RepeatWrapping,
+          repeatX: 2,
+          repeatY: 2,
+        });
+        const radTex = ctx.createTextureFromImage(radiatorImg, {
+          targetWidth: res,
+          targetHeight: res,
+          colorSpace: THREE.SRGBColorSpace,
+          wrapS: THREE.RepeatWrapping,
+          wrapT: THREE.RepeatWrapping,
+          repeatX: 1,
+          repeatY: 2,
+        });
+
+        const textures: THREE.Texture[] = [hullTex, russianTex, radTex];
+        let hullBump: THREE.CanvasTexture | null = null;
+        let russianBump: THREE.CanvasTexture | null = null;
+        let radBump: THREE.CanvasTexture | null = null;
+
+        if (tier === 'high') {
+          hullBump = deriveBumpFromImage(hullImg, 512, 2, 2);
+          russianBump = deriveBumpFromImage(russianImg, 512, 2, 2);
+          radBump = deriveBumpFromImage(radiatorImg, 512, 1, 2);
+          textures.push(hullBump, russianBump, radBump);
+        }
+
+        return {
+          textures,
+          apply: () => {
+            brushedAlumMat.map = hullTex;
+            brushedAlumMat.bumpMap = hullBump;
+            brushedAlumMat.bumpScale = hullBump ? 0.04 : 0.0;
+            brushedAlumMat.needsUpdate = true;
+
+            russianCreamMat.map = russianTex;
+            russianCreamMat.bumpMap = russianBump;
+            russianCreamMat.bumpScale = russianBump ? 0.048 : 0.0;
+            russianCreamMat.needsUpdate = true;
+
+            radiatorMat.map = radTex;
+            radiatorMat.bumpMap = radBump;
+            radiatorMat.bumpScale = radBump ? 0.028 : 0.0;
+            radiatorMat.needsUpdate = true;
+
+            trussMetalMat.map = radTex;
+            trussMetalMat.bumpMap = radBump;
+            trussMetalMat.bumpScale = radBump ? 0.032 : 0.0;
+            trussMetalMat.needsUpdate = true;
+          },
+        };
+      },
+    },
+    'medium'
+  );
+
+  // Register ISS Solar Array Wings LOD Slot
+  textureManager.registerSlot(
+    {
+      id: 'iss-solar',
+      thresholds: { high: 28, medium: 56, hysteresis: 4 },
+      getDistance: (cameraPos, tempVec) => {
+        stationGroup.getWorldPosition(tempVec);
+        return cameraPos.distanceTo(tempVec);
+      },
+      loadTier: async (tier: TextureLodTier, ctx) => {
+        const res = tier === 'high' ? 1024 : tier === 'medium' ? 512 : 256;
+        const solarImg = await ctx.loadImage(ISS_SOLAR_TEX_URL);
+        const solarTex = ctx.createTextureFromImage(solarImg, {
+          targetWidth: res,
+          targetHeight: res,
+          colorSpace: THREE.SRGBColorSpace,
+          wrapS: THREE.RepeatWrapping,
+          wrapT: THREE.RepeatWrapping,
+          repeatX: 1,
+          repeatY: 5,
+        });
+
+        const textures: THREE.Texture[] = [solarTex];
+        let solarBump: THREE.CanvasTexture | null = null;
+        if (tier === 'high') {
+          solarBump = deriveBumpFromImage(solarImg, 512, 1, 5);
+          textures.push(solarBump);
+        }
+
+        return {
+          textures,
+          apply: () => {
+            solarGoldMat.map = solarTex;
+            solarGoldMat.bumpMap = solarBump;
+            solarGoldMat.bumpScale = solarBump ? 0.03 : 0.0;
+            solarGoldMat.needsUpdate = true;
+          },
+        };
+      },
+    },
+    'medium'
+  );
   const cupolaGlassMat = new THREE.MeshPhysicalMaterial({
     color: 0x0f172a,
     roughness: 0.08,
